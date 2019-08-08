@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 
-# ----------------------------------------------------------------------------------------
-#
-# manager.py
-#
-# Created to manage add/remove worker operations in Citus docker-compose.
-#
-# ----------------------------------------------------------------------------------------
-import docker
+# Created to add and remove worker on a kubernetes cluster
+# Currently we are only handling only one worker node and one master
+# TODO: Listen to events on Kubernetes and add worker nodes dynamically
 from os import environ
 import psycopg2
 import signal
@@ -16,79 +11,56 @@ from sys import exit, stderr
 
 
 # adds a host to the cluster
-def add_worker(conn, host):
+def add_worker(conn, host, port):
     cur = conn.cursor()
-    worker_dict = ({'host': host, 'port': 5432})
+    worker_dict = ({'host': host, 'port': port})
 
     print("adding %s" % host, file=stderr)
     cur.execute("""SELECT master_add_node(%(host)s, %(port)s)""", worker_dict)
 
 
-# removes all placements from a host and removes it from the cluster
-def remove_worker(conn, host):
-    cur = conn.cursor()
-    worker_dict = ({'host': host, 'port': 5432})
-
-    print("removing %s" % host, file=stderr)
-    cur.execute("""DELETE FROM pg_dist_shard_placement WHERE nodename=%(host)s AND
-                                                             nodeport=%(port)s;
-                   SELECT master_remove_node(%(host)s, %(port)s)""", worker_dict)
-
-
-# connect_to_master method is used to connect to master coordinator at the start-up.
-# Citus docker-compose has a dependency mapping as worker -> manager -> master.
-# This means that whenever manager is created, master is already there, so we should
-# always be able to successfully connect
-def connect_to_master():
-    citus_host = environ.get('CITUS_HOST', 'master')
-    postgres_pass = environ.get('POSTGRES_PASSWORD', '')
-    postgres_user = environ.get('POSTGRES_USER', 'postgres')
-    postgres_db = environ.get('POSTGRES_DB', postgres_user)
-
+# Connect to master through CITUS_MASTER_HOST environment variable
+def get_db_connection(db_label, db_host, db_port, db_username, db_password, db_name):
     while True:
         try:
-            conn = psycopg2.connect("dbname=%s user=%s host=%s password=%s" %
-                                    (postgres_db, postgres_user, citus_host, postgres_pass))
+            conn = psycopg2.connect("dbname=%s user=%s host=%s password=%s port=%s" %
+                                    (db_name, db_username, db_host, db_password, db_port))
             break
-        except psycopg2.OperationalError as e:
-            print("Could not connect to postgresql on host %s. Sleeping for 1 second" % citus_host)
+        except psycopg2.OperationalError:
+            print("Could not connect to postgresql on db %s. Sleeping for 1 second" % db_label)
             time.sleep(1)
 
     conn.autocommit = True
 
-    print("connected to %s" % citus_host, file=stderr)
+    print("connected to %s" % db_label, file=stderr)
 
     return conn
 
 
-# main logic loop for the manager
-def docker_checker():
-    client = docker.DockerClient(base_url='unix:///var/run/docker.sock')
-    actions = {'health_status: healthy': add_worker, 'die': remove_worker}
+def setup_cluster():
+    # Database credentials
+    postgres_pass = environ.get('POSTGRES_PASSWORD', '')
+    postgres_user = environ.get('POSTGRES_USER', 'postgres')
+    postgres_db = environ.get('POSTGRES_DB', postgres_user)
 
-    # creates the necessary connection to make the sql calls if the master is ready
-    conn = connect_to_master()
+    # Get connection of master
+    citus_master_host = environ.get('CITUS_MASTER_SERVICE_HOST', 'localhost')
+    citus_master_port = environ.get('CITUS_MASTER_SERVICE_PORT', 5434)
+    conn_master = get_db_connection('citus master', citus_master_host, citus_master_port, postgres_user, postgres_pass,
+                                    postgres_db)
 
-    # introspect the compose project used by this citus cluster
-    my_hostname = environ['HOSTNAME']
-    this_container = client.containers.get(my_hostname)
-    compose_project = this_container.labels['com.docker.compose.project']
+    # Check whether worker is up and running
+    citus_worker_host = environ.get('CITUS_WORKER_SERVICE_HOST', 'localhost')
+    citus_worker_port = environ.get('CITUS_WORKER_SERVICE_PORT', 5432)
+    conn_worker = get_db_connection('citus worker', citus_worker_host, citus_worker_port, postgres_user, postgres_pass,
+                                    postgres_db)
 
-    # we only care about worker container health/die events from this cluster
-    print("found compose project: %s" % compose_project, file=stderr)
-    filters = {'event': list(actions),
-               'label': ["com.docker.compose.project=%s" % compose_project,
-                         "com.citusdata.role=Worker"],
-               'type': 'container'}
+    # Add the worker to master
+    add_worker(conn_master, citus_worker_host, citus_worker_port)
 
-    # touch a file to signal we're healthy, then consume events
-    print('listening for events...', file=stderr)
-    open('/manager-ready', 'a').close()
-    for event in client.events(decode=True, filters=filters):
-        worker_name = event['Actor']['Attributes']['name']
-        status = event['status']
-
-        status = actions[status](conn, worker_name)
+    # Just keep it alive for some time to debug
+    while True:
+        time.sleep(1)
 
 
 # implemented to make Docker exit faster (it sends sigterm)
@@ -98,8 +70,9 @@ def graceful_shutdown(signal, frame):
 
 
 def main():
+    print("Starting manager")
     signal.signal(signal.SIGTERM, graceful_shutdown)
-    docker_checker()
+    setup_cluster()
 
 
 if __name__ == '__main__':
