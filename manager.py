@@ -49,18 +49,17 @@ def setup_cluster():
     conn_master = get_db_connection('citus master', citus_master_host, citus_master_port, postgres_user, postgres_pass,
                                     postgres_db)
 
+    # This is used by Health Check to test for readiness
+    open('/manager-ready', 'a').close()
+
     # Check whether worker is up and running
     citus_worker_host = environ.get('CITUS_WORKER_SERVICE_HOST', 'localhost')
     citus_worker_port = environ.get('CITUS_WORKER_SERVICE_PORT', 5432)
-    conn_worker = get_db_connection('citus worker', citus_worker_host, citus_worker_port, postgres_user, postgres_pass,
-                                    postgres_db)
+    get_db_connection('citus worker', citus_worker_host, citus_worker_port, postgres_user, postgres_pass,
+                      postgres_db)
 
     # Add the worker to master
     add_worker(conn_master, citus_worker_host, citus_worker_port)
-
-    # Just keep it alive for some time to debug
-    while True:
-        time.sleep(1)
 
 
 # implemented to make Docker exit faster (it sends sigterm)
